@@ -1,7 +1,7 @@
 ﻿using System.CommandLine;
 using System.CommandLine.Invocation;
 using System.ComponentModel.DataAnnotations;
-using System.Runtime.InteropServices;
+using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using OpenQA.Selenium;
@@ -9,219 +9,222 @@ using OpenQA.Selenium.Chrome;
 using OpenQA.Selenium.Edge;
 using OpenQA.Selenium.Firefox;
 using OpenQA.Selenium.Support.UI;
+using Pastel;
 
 RootCommand rootCommand = new();
 
-Option<string> browserOption = new(new[] { "--browser", "-b" }, "Which browser to use");
-browserOption.AddCompletions("chrome", "chromium", "firefox", "edge");
-
-if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) browserOption.SetDefaultValue("edge");
-else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux)) browserOption.SetDefaultValue("firefox");
+Option<string> browserOption = new(new[] { "--browser", "-b" }, "Which browser to use"){ IsRequired = true};
+Enum.GetNames(typeof(WebDriverType)).ToList().ForEach(browser => browserOption.AddCompletions(browser));
 
 browserOption.AddValidator(result =>
 {
-    if (result.Tokens.Count == 1 && result.Tokens[0].Value is { } browser &&
-        new[] { "chrome", "chromium", "firefox", "edge" }.Contains(browser.ToLower())) return;
-    Console.WriteLine("Browser must be either chrome, chromium, firefox or edge");
+    var value = result.GetValueOrDefault<string>();
+    if (value is null)
+    {
+        Console.Error.WriteLine("Browser cannot be empty".Pastel(ConsoleColor.Red));
+        Environment.Exit(1);
+    }
+    if (Enum.TryParse<WebDriverType>(value, true, out _))
+        return;
+
+    Console.Error.WriteLine("Browser must be either chrome, chromium, firefox or edge");
     Environment.Exit(1);
 });
-browserOption.IsRequired = true;
 
-Option<string[]> urlsOption = new(new[]
-    {
-        "--urls",
-        "-u"
-    },
-    "The URL/s to open, you can do do for example -u example.com example-1.com\n" +
-    "Or -u example.com -u example-1.com");
+Option<string[]> urlsOption = new(new[] { "--urls", "-u" },
+    "The URL/s to open, you can do do for example -u youtube.com twitter.com\n" +
+    "Or -u youtube.com -u twitter.com") { AllowMultipleArgumentsPerToken = true };
 urlsOption.AddValidator(result =>
 {
-    result.Tokens.Select(t => t.Value)
-        .Where(url => url is not { } || 
-                      !Uri.IsWellFormedUriString(url, UriKind.Absolute))
-        .ToList()
-        .ForEach(url => Console.WriteLine($"URL {url} is not valid"));
-});
-urlsOption.IsRequired = false;
-urlsOption.AllowMultipleArgumentsPerToken = true;
-
-Option<string> urlsPathOption = new(new[]
+    var value = result.GetValueOrDefault<string[]>();
+    if (value is null)
     {
-        "--urls-path",
-        "-up"
-    },
+        Console.Error.WriteLine("URL cannot be empty".Pastel(ConsoleColor.Red));
+        Environment.Exit(1);
+    }
+    foreach (var url in value)
+    {
+        if (Uri.IsWellFormedUriString(url, UriKind.Absolute))
+            continue;
+        Console.WriteLine($"URL: \"{url}\" is not valid, and it will be ignored");
+    }
+});
+
+Option<string[]> urlsPathOption = new(new[] { "--urls-path", "-up" },
     "The path to a file containing URLs to open\nEach URL must be place on a new line");
 urlsPathOption.AddValidator(result =>
 {
-    foreach (var path in result.Tokens.Select(t => t.Value))
+    var paths = result.GetValueOrDefault<string[]>();
+    if (paths is null)
     {
-        if (path is not { })
-        {
-            Console.WriteLine("Path cannot be empty");
-            continue;
-        }
-
-        if (!File.Exists(path))
-        {
-            Console.WriteLine($"File {path} does not exist");
-            continue;
-        }
-        
-        if (!File.ReadAllLines(path).Any(url => url is not { } ||
-                                                !Uri.IsWellFormedUriString(url, UriKind.Absolute))) continue;
-        // get invalid url and tell user to remove that url from list
-        var invalidUrl = File.ReadAllLines(path).First(url => url is not { } ||
-                                                             !Uri.IsWellFormedUriString(url, UriKind.Absolute));
-        Console.WriteLine($"URL: \"{invalidUrl}\" in file {path} is not valid\nPlease remove it from the file");
+        Console.Error.WriteLine("Path cannot be empty".Pastel(ConsoleColor.Red));
         Environment.Exit(1);
     }
-});
-urlsPathOption.IsRequired = false;
-
-Option<string> loginFileOption = new(new[] { "--login-file", "-l" }, "The file containing the login credentials");
-loginFileOption.AddValidator(result =>
-{
-    var extension = Path.GetExtension(result.Tokens[0].Value);
-    if (extension is not { } || !new[] { ".txt", ".json" }.Contains(extension.ToLower()))
-        Console.WriteLine("Login file must be either a .txt or .json file");
-    else switch (extension)
+    foreach (var path in paths)
     {
-        case ".txt":
+        if (!File.Exists(path))
         {
-            try
-            {
-                var lines = File.ReadAllLines(result.Tokens[0].Value);
-                if (lines.Length != 2 || lines[0] is not { } || lines[1] is not { })
-                    Console.WriteLine(
-                        "Login file must contain an email on the first line and a password on the second line");
-                if (lines[0] is not { } || !new EmailAddressAttribute().IsValid(lines[0]))
-                {
-                    Console.WriteLine("Email is not valid");
-                    Environment.Exit(1);
-                }
-            }
-            catch (FileNotFoundException e)
-            { 
-                Console.WriteLine($"File {e.FileName} does not exist");
-                Environment.Exit(1);
-            }
-            break;
+            Console.Error.WriteLine($"File {path} does not exist".Pastel(ConsoleColor.Red));
+            continue;
         }
-        case ".json":
+
+        var lines = File.ReadAllLines(path);
+        foreach (var line in lines)
         {
-            string? json = null;
-            try
+            if (!Uri.TryCreate(line, UriKind.RelativeOrAbsolute, out var uri) ||
+                (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
             {
-                json = File.ReadAllText(result.Tokens[0].Value);
+                Console.WriteLine($"URL: \"{line}\" is not valid, and it will be ignored".Pastel(ConsoleColor.DarkYellow));
             }
-            catch (FileNotFoundException e)
-            { 
-                Console.WriteLine($"File {e.FileName} does not exist");
-                Environment.Exit(1);
-            }
-            JsonSerializer.Deserialize<Login>(json);
-            if (json is not { } || !new EmailAddressAttribute().IsValid(JsonSerializer.Deserialize<Login>(json)?.Email!))
-            {
-                Console.WriteLine("Email is not valid");
-                Environment.Exit(1);
-            }
-            break;
         }
     }
 });
-loginFileOption.IsRequired = true;
 
-foreach (var option in new Option[]
-         {
-             browserOption,
-             urlsOption,
-             urlsPathOption,
-             loginFileOption
-         })
+Option<string> loginFileOption = new(new[] { "--login-file", "-l" }, "The JSON file containing the login credentials") { IsRequired = true};
+loginFileOption.AddValidator(result =>
+{
+    var value = result.GetValueOrDefault<string>();
+    if (value is null)
+    {
+        Console.Error.WriteLine("Login file cannot be empty".Pastel(ConsoleColor.Red));
+        Environment.Exit(1);
+    }
+    if (!File.Exists(value))
+    {
+        Console.Error.WriteLine($"File {value} does not exist".Pastel(ConsoleColor.Red));
+        Environment.Exit(1);
+    }
+
+    var json = File.ReadAllText(value);
+    LoginJson? deserialize = null;
+    try
+    {
+        deserialize = JsonSerializer.Deserialize<LoginJson>(json);
+    }
+    catch (Exception)
+    {
+        Console.Error.WriteLine("Error while parsing login file".Pastel(ConsoleColor.Red));
+        Environment.Exit(1);
+    }
+    var validEmail = new EmailAddressAttribute().IsValid(deserialize!.Email);
+    if (validEmail)
+        return;
+
+    Console.Error.WriteLine("Email is not valid".Pastel(ConsoleColor.Red));
+    Environment.Exit(1);
+});
+
+Option[] options = { browserOption, urlsOption, urlsPathOption, loginFileOption };
+foreach (var option in options)
     rootCommand.AddOption(option);
 
 rootCommand.SetHandler(HandleInput);
 
 await rootCommand.InvokeAsync(args);
 
+IWebDriver GetWebDriver(WebDriverType driverType)
+{
+    switch (driverType)
+    {
+        case WebDriverType.Chrome:
+            {
+                var service = ChromeDriverService.CreateDefaultService();
+                service.EnableVerboseLogging = false;
+                return new ChromeDriver(service);
+            }
+        case WebDriverType.Firefox:
+            {
+                var service = FirefoxDriverService.CreateDefaultService();
+                service.LogLevel = FirefoxDriverLogLevel.Fatal;
+                return new FirefoxDriver(service);
+            }
+        case WebDriverType.Edge:
+            {
+                var service = EdgeDriverService.CreateDefaultService();
+                service.UseVerboseLogging = false;
+                return new EdgeDriver(service);
+            }
+        default:
+            throw new ArgumentException("Invalid WebDriverType specified");
+    }
+}
+
 Task HandleInput(InvocationContext invocationContext)
 {
-    var webDriver = invocationContext.ParseResult.GetValueForOption(browserOption);
+    var webDriver = invocationContext.ParseResult.GetValueForOption(browserOption)!;
 
-    WebDriver? driver = null;
+    IWebDriver driver;
     try
     {
-        driver = webDriver switch
-        {
-            "firefox" => new FirefoxDriver(),
-            "chrome" => new ChromeDriver(),
-            "chromium" => new ChromeDriver(),
-            "edge" => new EdgeDriver(),
-            _ => throw new Exception("Invalid browser")
-        };
+        driver = GetWebDriver(Enum.Parse<WebDriverType>(webDriver, true));
     }
-    catch (DriverServiceNotFoundException e)
+    catch (Exception)
     {
-        if (e.Message.Contains("driver"))
-        {
-            Console.WriteLine($"Browser {webDriver} is not installed");
-            Environment.Exit(1);
-        }
-    }
-
-    var urls = invocationContext.ParseResult.GetValueForOption(urlsOption);
-    var paths = invocationContext.ParseResult.GetValueForOption(urlsPathOption);
-    urls = paths is not { } ? urls : File.ReadAllLines(paths);
-    
-    // if urls is null or empty throw an error
-    if (urls is not { }) 
-        throw new InvalidOperationException("No URLs provided");
-
-    var loginFile = invocationContext.ParseResult.GetValueForOption(loginFileOption);
-    var extension = new FileInfo(loginFile!).Extension;
-    
-    (string email, string password) GetLoginFromTxt(string s)
-    {
-        var lines = File.ReadAllLines(s);
-        return (lines[0], lines[1]);
-    }
-
-    (string email, string password) GetLoginFromJson(string s)
-    {
-        var json = File.ReadAllText(s);
-        var login = JsonSerializer.Deserialize<Login>(json);
-        return (login?.Email, login?.Password)!;
-    }
-
-    var (email, password) = extension switch
-    {
-        ".txt" => GetLoginFromTxt(loginFile ?? string.Empty),
-        ".json" => GetLoginFromJson(loginFile ?? string.Empty),
-        _ => throw new InvalidOperationException("Invalid login file")
-    };
-
-    if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(password))
-    {
-        Console.WriteLine("Your missing an email or a password");
+        Console.Error.WriteLine("Error while creating WebDriver".Pastel(ConsoleColor.Red));
+        Environment.Exit(1);
         return Task.CompletedTask;
     }
 
-    driver?.Navigate().GoToUrl("https://archive.org/account/login");
-    driver?.FindElement(By.Name("username")).SendKeys(email);
-    driver?.FindElement(By.Name("password")).SendKeys(password);
-    driver?.FindElement(By.Name("submit-to-login")).Click();
-    
+    var urls = invocationContext.ParseResult.GetValueForOption(urlsOption);
+    // gets all urls that are valid and ignores the ones that are not
+    urls = urls?.Where(url => Uri.IsWellFormedUriString(url, UriKind.Absolute)).ToArray();
+    if (urls is null)
+    {
+        Console.Error.WriteLine("URL cannot be empty".Pastel(ConsoleColor.Red));
+        Environment.Exit(1);
+    }
+    // If path is not null it will read the file and add the URLs to the array
+    var paths = invocationContext.ParseResult.GetValueForOption(urlsPathOption);
+    if (paths is not null)
+    {
+        foreach (var path in paths)
+        {
+            if (!File.Exists(path))
+            {
+                Console.Error.WriteLine($"File {path} does not exist".Pastel(ConsoleColor.Red));
+                continue;
+            }
+
+            var lines = File.ReadAllLines(path);
+            urls = urls.Concat(lines.Where(url => Uri.IsWellFormedUriString(url, UriKind.Absolute))).ToArray();
+        }
+    }
+
+    var loginFile = invocationContext.ParseResult.GetValueForOption(loginFileOption);
+
+    var deserialize = JsonSerializer.Deserialize<LoginJson>(File.ReadAllText(loginFile!));
+    var email = deserialize!.Email;
+    var password = deserialize.Password;
+
+    driver.Navigate().GoToUrl("https://archive.org/account/login");
+    driver.FindElement(By.Name("username")).SendKeys(email);
+    driver.FindElement(By.Name("password")).SendKeys(password);
+    driver.FindElement(By.Name("submit-to-login")).Click();
+    Thread.Sleep(TimeSpan.FromSeconds(3));
+
+    IWebElement? error = null;
+    try
+    {
+        error = driver.FindElement(By.CssSelector("span.login-error"));
+    }
+    catch (Exception) { /* ignored */ }
+    if (error is not null)
+    {
+        Console.Error.WriteLine("Invalid Email or Password".Pastel(ConsoleColor.Red));
+        driver.Quit();
+        return Task.CompletedTask;
+    }
+
     SaveUrl(driver, urls);
-    driver?.Quit();
+    driver.Quit();
     return Task.CompletedTask;
 }
 
-void SaveUrl(IWebDriver? webDriver, IEnumerable<string>? urls)
+void SaveUrl(IWebDriver? webDriver, IEnumerable<string> urls)
 {
-    var enumerable = (urls ?? Array.Empty<string>()).ToList();
-    foreach (var url in enumerable)
+    foreach (var url in urls)
     {
-        Thread.Sleep(3500);
+        Thread.Sleep(TimeSpan.FromSeconds(5));
         try
         {
             webDriver?.Navigate().GoToUrl("https://web.archive.org/save");
@@ -232,30 +235,36 @@ void SaveUrl(IWebDriver? webDriver, IEnumerable<string>? urls)
         }
         catch (WebDriverException e)
         {
-            if(e.Data.Contains("timed out"))
+            if (e.Data.Contains("timed out"))
                 Console.WriteLine("Wayback Machine has timed out please try again");
         }
-        
+
         var inputUrl = webDriver?.FindElement(By.Id("web-save-url-input"));
         inputUrl?.SendKeys(url);
-        
+
         var captureOutlinks = webDriver?.FindElement(By.Id("capture_outlinks"));
         captureOutlinks?.Click();
-        
+
         var captureScreenshot = webDriver?.FindElement(By.Id("capture_screenshot"));
         captureScreenshot?.Click();
-        
+
         var savePageButton = webDriver?.FindElement(By.ClassName("web-save-button"));
         savePageButton?.Click();
 
+        Stopwatch? stopWatch = null;
         WebDriverWait? wait = null;
         try
         {
             var savingMsg = webDriver?.FindElement(By.Id("saving-msg"));
+            stopWatch = new Stopwatch();
             if ((bool)savingMsg?.Displayed)
+            {
+                stopWatch.Start();
                 Console.WriteLine($"Saving URL: {url}");
+            }
             wait = new WebDriverWait(webDriver, TimeSpan.FromSeconds(60));
             wait.Until(_ => !savingMsg.Displayed);
+            stopWatch.Stop();
         }
         catch (NoSuchElementException) { /* ignored */ }
 
@@ -267,7 +276,7 @@ void SaveUrl(IWebDriver? webDriver, IEnumerable<string>? urls)
                     webDriver?.FindElement(By.CssSelector("span.label-success:nth-child(2) > span:nth-child(1)"));
                 if (doneMsg is { Displayed: true })
                 {
-                    Console.WriteLine($"{url} is saved");
+                    Console.WriteLine($"Saved: {url} in {stopWatch?.Elapsed.TotalSeconds:#.##} seconds".Pastel(ConsoleColor.Green));
                     continue;
                 }
             }
@@ -279,12 +288,12 @@ void SaveUrl(IWebDriver? webDriver, IEnumerable<string>? urls)
             var error = webDriver?.FindElement(By.CssSelector(".col-md-offset-4 > p:nth-child(2)"));
             if (error!.Displayed)
             {
-                Console.WriteLine($"URL: {url} has already been captured 10 times");
+                Console.WriteLine($"URL: {url} has already been captured 10 times".Pastel(ConsoleColor.DarkYellow));
                 continue;
             }
         }
         catch (NoSuchElementException) { /* ignored */ }
-        
+
         try
         {
             var captureMsg = webDriver?.FindElement(By.CssSelector(".col-md-8 > p:nth-child(2)"));
@@ -300,21 +309,23 @@ void SaveUrl(IWebDriver? webDriver, IEnumerable<string>? urls)
                 By.XPath("//p[contains(text(), 'The same snapshot had been made')]"));
             if ((bool)snapshot?.Any())
             {
-                Console.WriteLine($"Already existing snapshot: {url}");
-                continue;
+                Console.WriteLine($"Already existing snapshot: {url}".Pastel(ConsoleColor.DarkYellow));
             }
         }
         catch (WebDriverException) { /* ignored */ }
-        
-        Console.ForegroundColor = ConsoleColor.Green;
-        Console.WriteLine($"Saved: {url}");
-        Console.ResetColor();
     }
 }
 
-public class Login
+internal enum WebDriverType
 {
-    public Login(string email, string password)
+    Chrome,
+    Firefox,
+    Edge
+}
+
+internal class LoginJson
+{
+    public LoginJson(string email, string password)
     {
         Email = email;
         Password = password;
@@ -324,5 +335,5 @@ public class Login
     public string Email { get; set; }
 
     [JsonPropertyName("password")]
-    public string Password{ get; set; }
+    public string Password { get; set; }
 }
